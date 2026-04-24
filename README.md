@@ -13,8 +13,8 @@
 
 | Status | Step | Why it matters | Minimum deliverable |
 |---|---|---|---|
-| 🔴 | 1. Data pipeline and visualization | Need a stable base before doing any motion analysis | Load video, inspect frames, save clips/plots |
-| 🔴 | 2. Simple synthetic motion dataset | Lets us debug theory on easy controlled cases | One moving blob / patch with known velocity |
+| 🟢 | 1. Data pipeline and visualization | Need a stable base before doing any motion analysis | Load video, inspect frames, save clips/plots |
+| 🟢 | 2. Simple synthetic motion dataset | Lets us debug theory on easy controlled cases | One moving blob / patch with known velocity |
 | 🔴 | 3. 3D Fourier transform baseline | Core representation of the project | Compute 3D FFT of video volume |
 | 🔴 | 4. Dominant plane detection | Main proposed motion cue | Recover one dominant velocity from simple motion |
 | 🔴 | 5. Velocity-to-plane conversion validation | Ensures the geometry is implemented correctly | Show detected plane matches known synthetic motion |
