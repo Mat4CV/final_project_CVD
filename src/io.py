@@ -27,8 +27,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Sequence, Tuple
+import warnings
 
+import matplotlib.pyplot as plt
 import numpy as np
+from tqdm import tqdm
 
 try:
     import cv2
@@ -346,6 +349,162 @@ def save_mp4(
         writer.write(frame_bgr)
 
     writer.release()
+
+
+def get_codec_for_format(format: str):
+    """
+    Get appropriate fourcc codec string for given video format.
+    For MP4, tries avc1 first and falls back to mp4v if unavailable.
+    """
+    format = format.lower()
+    if format == "mp4":
+        return _get_mp4_codec()
+    elif format == "avi":
+        return "FFV1"
+    elif format == "mov":
+        return "avc1"
+    else:
+        raise ValueError(f"I haven't added the codec for: {format}")
+
+
+def _get_mp4_codec() -> str:
+    """
+    Colab silently fails to write MP4 files with avc1 (H.264) codec, but mp4v works fine.
+    Check which codec is available in this OpenCV build by trying to write a small test video.
+
+    Test whether avc1 (H.264) is available in this OpenCV build.
+    Falls back to mp4v if not. Raises RuntimeError if neither works.
+    """
+    import tempfile, os
+    test_frame = np.zeros((64, 64, 3), dtype=np.uint8)
+    for codec in ["avc1", "mp4v"]:
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            tmp_path = f.name
+        try:
+            fourcc = cv2.VideoWriter_fourcc(*codec)
+            writer = cv2.VideoWriter(tmp_path, fourcc, 24, (64, 64), isColor=True)
+            writer.write(test_frame)
+            writer.release()
+            if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
+                print(f"MP4 codec selected: {codec}")
+                return codec
+            else:
+                warnings.warn(f"MP4 codec '{codec}' produced no output, trying next...")
+        except Exception as e:
+            warnings.warn(f"MP4 codec '{codec}' raised an error: {e}, trying next...")
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+    raise RuntimeError("No working MP4 codec found (tried avc1, mp4v). Consider using imageio+ffmpeg instead.")
+
+
+def to_video(
+    frames: np.ndarray, path, res_scale=1.0, playback_fps=None, gamma=1.0, cmap=None, fileformat=None,
+    vmin=None, vmax=None, quantile=None, framenames=None
+):
+    """
+    Saves video frame arrays to a video file or sequence of PNGs. If path has no extension, 
+    it is treated as a directory and individual image files are saved.
+
+    Args:
+        frames (np.ndarray): (T x H x W x C) (RGB) or (T x H x W) (intensity) video frames.
+        path (str or Path): output video file path or directory for image files.
+        res_scale (float): resolution scaling factor with nearest neighbor interpolation.
+        cmap: ignored if frames are RGB; otherwise, matplotlib colormap name or object.
+        fileformat (str or None): video format (e.g., "mp4", "avi"), or image format (e.g., "png");
+            if None, inferred from path suffix.
+        quantile (float or None): if not None, use quantiles to determine vmin and vmax for normalization
+            (ignored if vmin or vmax are specified).
+    """
+    path = Path(path)
+    if cmap is None:
+        cmap = "viridis"
+    cmap_fn = plt.get_cmap(cmap)
+    is_rgb = False
+    if frames.ndim == 4:
+        if frames.shape[3] == 3:
+            is_rgb = True
+        else:
+            raise ValueError("4D frames array must have shape (T, H, W, 3) for RGB video")
+    elif frames.ndim == 3:
+        is_rgb = False
+    else:
+        raise ValueError("frames must be a 3D or 4D numpy array")
+
+    # compute a normalized intensity in [0,1] for colormap input
+    if vmax is None:
+        if quantile is not None:
+            vmax = float(np.quantile(frames, quantile))
+        else:
+            vmax = float(np.max(frames))
+    if vmin is None:
+        if quantile is not None:
+            vmin = float(np.quantile(frames, 1 - quantile))
+        else:
+            vmin = float(np.min(frames))
+            if vmin >= 0:
+                vmin = 0.0
+
+    H, W = frames.shape[1], frames.shape[2]
+    if res_scale != 1.0:
+        out_W = int(W * res_scale)
+        out_H = int(H * res_scale)
+    else:
+        out_W = W
+        out_H = H
+    # if path is a directory, write individual image files
+    is_video_file = path.suffix in [".mp4", ".avi", ".mov", ".mkv"]
+    if not is_video_file:
+        path.mkdir(parents=True, exist_ok=True)
+        if fileformat is None:
+            fileformat = "png"
+    else:
+        if playback_fps is None:
+            raise ValueError("playback_fps must be specified if saving a video file")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if fileformat is None:
+            fileformat = path.suffix[1:].lower()
+        codec = get_codec_for_format(fileformat)
+        fourcc = cv2.VideoWriter_fourcc(*codec)
+        vidwriter = cv2.VideoWriter(str(path), fourcc, playback_fps, (out_W, out_H), isColor=True)
+
+    max_frames = len(frames)
+
+    if not is_video_file:
+        allpaths = []
+    for i in tqdm(range(max_frames), desc="Writing video frames"):
+        intensity = (np.clip(frames[i], vmin, vmax) - vmin) / (vmax - vmin)  # normalize to [0,1]
+        if gamma != 1:
+            intensity = intensity ** gamma
+        if is_rgb:
+            rgb_mapped = (intensity * 255.0).astype(np.uint8)  # (H,W,3) in RGB
+        else:
+            # apply matplotlib colormap -> returns RGBA in [0,1]
+            rgba_mapped = cmap_fn(intensity)  # shape (H,W,4)
+            rgb_mapped = (rgba_mapped[..., :3] * 255.0).astype(np.uint8)  # (H,W,3) in RGB
+        bgr_mapped = rgb_mapped[..., ::-1]  # convert to BGR for OpenCV
+        if res_scale != 1.0:
+            bgr_mapped = cv2.resize(bgr_mapped, (out_W, out_H), interpolation=cv2.INTER_NEAREST)
+
+        if is_video_file:
+            vidwriter.write(bgr_mapped)
+        else:
+            if framenames is None:
+                frame_path = path / f"frame_{i:05d}.{fileformat}"
+            else:
+                frame_path = path / f"{framenames[i]}.{fileformat}"
+            if fileformat.lower() == "png":
+                # higher compression level because there's thousands of frames
+                # reminder for anyone reading here; IT'S LOSSLESS COMPRESSION BECAUSE IT'S A PNG
+                cv2.imwrite(str(frame_path), bgr_mapped, [cv2.IMWRITE_PNG_COMPRESSION, 5])
+            else:
+                cv2.imwrite(str(frame_path), bgr_mapped)
+            allpaths.append(frame_path)
+    if is_video_file:
+        vidwriter.release()
+    if not is_video_file:
+        return allpaths
+    return path
 
 
 def inspect_video(

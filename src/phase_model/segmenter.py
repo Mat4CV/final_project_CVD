@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+from typing import List, Tuple
+import warnings
 
 import numpy as np
 
@@ -376,3 +378,143 @@ class FourierVisionSegmenter:
             z=z,
             A=A,
         )
+    
+
+class AdditiveImageSeparator:
+    """
+    Separate m additive component images from N composite frames.
+ 
+    Each component image is assumed to translate at a distinct, known,
+    constant velocity (pixels/frame).  Works for any m >= 2, and any N >= m
+    (more frames gives better noise robustness).
+ 
+    The book (Vernon 2001, Ch.3) states that for m components you need 2m
+    equations (i.e. 2m frames) when velocities are UNKNOWN.  Here velocities
+    are assumed already found (e.g. via Hough transform), so the unknowns
+    are only the m phasors Fⁱ_t0 — making N >= m sufficient, with N >= 2m
+    still recommended for conditioning.
+ 
+    Parameters
+    ----------
+    velocities : list of (vx, vy) tuples, length m
+        Known velocity of each component in pixels/frame.
+    dt : float
+        Time step between frames (default 1.0).
+    eps : float
+        Tikhonov regularisation for near-singular (degenerate) frequencies.
+ 
+    Example
+    -------
+    sep = AdditiveImageSeparator(velocities=[(2, 1), (-1, 2), (0, -3)])
+    imgs = sep.separate(frames)   # frames: (N, H, W) array
+    img1, img2, img3 = imgs
+    """
+ 
+    def __init__(
+        self,
+        velocities: List[Tuple[float, float]],
+        dt: float = 1.0,
+        eps: float = 1e-8,
+    ):
+        self.velocities = [np.array(v, dtype=float) for v in velocities]
+        self.m = len(velocities)
+        self.dt = dt
+        self.eps = eps
+ 
+    # ── public ────────────────────────────────────────────────────────────────
+ 
+    def separate(self, frames: np.ndarray) -> np.ndarray:
+        """
+        Recover all N frames for each of the m component images.
+ 
+        Parameters
+        ----------
+        frames : (N, H, W) float array
+            Composite image sequence.  frames[j] = sum_i f^i_tj.
+ 
+        Returns
+        -------
+        sequences : (m, N, H, W) float array
+            sequences[i, j] is component i at time t_j.
+            sequences[i, 0] is the t=0 frame (same as before).
+        """
+        frames = np.asarray(frames, dtype=float)
+        N, H, W = frames.shape
+        m = self.m
+ 
+        if N < m:
+            raise ValueError(
+                f"Need at least N={m} frames for m={m} components; got {N}. "
+                f"Recommended N >= 2m = {2*m} for good conditioning."
+            )
+        if N < 2 * m:
+            warnings.warn(
+                f"N={N} < 2m={2*m}: fewer frames than the book recommends. "
+                "Results may be inaccurate. Add more frames if possible.",
+                stacklevel=2,
+            )
+ 
+        # ── 1. FFT every frame  →  shape (N, H, W) complex ────────────────
+        F = np.stack([np.fft.fft2(frames[j]) for j in range(N)], axis=0)
+ 
+        # ── 2. Angular spatial-frequency grids (FFT layout) ───────────────
+        wx = 2 * np.pi * np.fft.fftfreq(W)   # (W,)
+        wy = 2 * np.pi * np.fft.fftfreq(H)   # (H,)
+        WX, WY = np.meshgrid(wx, wy)           # (H, W)
+        HW = H * W
+ 
+        # ── 3. Per-frame phase factors for each component ─────────────────
+        #   ΔΦᵢ(wx,wy) = exp(-i (wx·vxᵢ + wy·vyᵢ) · dt)
+        #   shape (HW,) per component
+        dPhi = []
+        for v in self.velocities:
+            phi = np.exp(-1j * (WX * v[0] + WY * v[1]) * self.dt).ravel()
+            dPhi.append(phi)                   # (HW,)
+ 
+        # ── 4. Design matrix A  (Vandermonde in ΔΦ) ──────────────────────
+        #   A[j, i, freq] = ΔΦᵢ(freq)^j
+        #   We build shape (HW, N, m) — frequencies as the batch dimension.
+        j_idx = np.arange(N)                   # (N,)
+ 
+        # Each column: (HW,)^j broadcast → (N, HW), then transposed → (HW, N)
+        cols = [(dPhi[i][np.newaxis, :] ** j_idx[:, np.newaxis]).T
+                for i in range(m)]             # each (HW, N)
+ 
+        A = np.stack(cols, axis=-1)            # (HW, N, m)
+ 
+        # ── 5. Observation vector b  →  (HW, N, 1) ────────────────────────
+        b = F.reshape(N, HW).T[:, :, np.newaxis]  # (HW, N, 1)
+ 
+        # ── 6. Least-squares via normal equations: x = (AᴴA)⁻¹ Aᴴb ───────
+        #   Solves for Fⁱ_t0 at every (wx,wy) simultaneously.
+        #   AᴴA : (HW, m, m)
+        #   Aᴴb : (HW, m, 1)
+        AH = np.conj(A).transpose(0, 2, 1)    # (HW, m, N)
+        AHA = AH @ A                           # (HW, m, m)
+        AHb = AH @ b                           # (HW, m, 1)
+ 
+        # Tikhonov regularisation: AᴴA + ε·I
+        eye_m = np.eye(m, dtype=complex)[np.newaxis]  # (1, m, m)
+        AHA += self.eps * eye_m
+ 
+        x = np.linalg.solve(AHA, AHb)         # (HW, m, 1)
+        x = x.squeeze(-1)                      # (HW, m)
+ 
+        # x[:, i] = Fⁱ_t0(wx, wy)  — the t=0 Fourier spectrum of component i
+ 
+        # ── 7. Propagate each component forward: Fⁱ_tj = Fⁱ_t0 · ΔΦᵢ^j ──
+        #   then iFFT to get all N spatial frames per component.
+        #
+        #   sequences[i, j] = ifft2( Fⁱ_t0 · ΔΦᵢ^j )
+        sequences = np.empty((m, N, H, W), dtype=float)
+ 
+        for i in range(m):
+            Fi_t0 = x[:, i].reshape(H, W)          # (H, W) complex
+            dPhi_i = dPhi[i].reshape(H, W)          # (H, W) complex
+ 
+            for j in range(N):
+                # Apply j-th power of the phase ramp → shift component by j frames
+                Fi_tj = Fi_t0 * (dPhi_i ** j)       # (H, W) complex
+                sequences[i, j] = np.real(np.fft.ifft2(Fi_tj))
+ 
+        return sequences
