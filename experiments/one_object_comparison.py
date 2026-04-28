@@ -7,7 +7,7 @@ Compares:
 
 Example:
 
-    uv run python scripts/run_one_object_benchmark.py \
+    uv run python experiments/one_object_comparison.py \
         --out results/one_object_benchmark.csv \
         --methods phase plane \
         --shapes gaussian disk square \
@@ -24,30 +24,31 @@ Example:
         --num-workers 4 \
         --use-gpu
 
+Resume example:
+
+    uv run python experiments/one_object_comparison.py \
+        --out results/one_object_gaussian.csv \
+        --shapes gaussian \
+        --resume \
+        --use-gpu \
+        --num-workers 1
+
 Notes:
     - If you only have one GPU, do not set num-workers too high.
     - For CPU-only runs, omit --use-gpu.
+    - With --resume, the script counts existing rows in the CSV and skips that
+      many jobs from the deterministic job list.
+    - Use --overwrite only when you intentionally want to delete the old CSV.
 """
+
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-
-THIS_FILE = Path(__file__).resolve()
-PROJECT_ROOT = THIS_FILE.parents[1]   # .../final_project
-SRC_PATH = PROJECT_ROOT / "src"
-
-if str(SRC_PATH) not in sys.path:
-    sys.path.insert(0, str(SRC_PATH))
-
-print("PROJECT_ROOT:", PROJECT_ROOT)
-print("SRC_PATH:", SRC_PATH)
-print("SRC exists:", SRC_PATH.exists())
 import argparse
 import itertools
 import json
 import math
 import os
+import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -57,6 +58,22 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+# ----------------------------
+# Import path setup
+# ----------------------------
+
+THIS_FILE = Path(__file__).resolve()
+PROJECT_ROOT = THIS_FILE.parents[1]
+SRC_PATH = PROJECT_ROOT / "src"
+
+if str(SRC_PATH) not in sys.path:
+    sys.path.insert(0, str(SRC_PATH))
+
+print("PROJECT_ROOT:", PROJECT_ROOT)
+print("SRC_PATH:", SRC_PATH)
+print("SRC exists:", SRC_PATH.exists())
 
 
 # ----------------------------
@@ -138,7 +155,11 @@ def endpoint_error(
     v_hat: tuple[float, float],
     v_gt: tuple[float, float],
 ) -> float:
-    return float(np.linalg.norm(np.asarray(v_hat, dtype=float) - np.asarray(v_gt, dtype=float)))
+    return float(
+        np.linalg.norm(
+            np.asarray(v_hat, dtype=float) - np.asarray(v_gt, dtype=float)
+        )
+    )
 
 
 def speed_error(
@@ -194,6 +215,43 @@ def score_diagnostics(score_map: np.ndarray) -> dict[str, float]:
         "peak_ratio": peak_ratio,
         "peak_margin": peak_margin,
     }
+
+
+# ----------------------------
+# Resume helpers
+# ----------------------------
+
+def count_existing_rows(out_path: Path) -> int:
+    """
+    Count completed rows in an existing CSV.
+
+    This is intentionally simple and compatible with old partial CSVs that
+    do not contain all newer resume-key columns.
+    """
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return 0
+
+    try:
+        return len(pd.read_csv(out_path))
+    except pd.errors.EmptyDataError:
+        return 0
+
+
+def load_existing_results(out_path: Path) -> list[dict[str, Any]]:
+    """
+    Load existing rows for final summary printing.
+
+    This does not affect resume behavior. Resume is row-count based.
+    """
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        return []
+
+    try:
+        df = pd.read_csv(out_path)
+    except pd.errors.EmptyDataError:
+        return []
+
+    return df.to_dict(orient="records")
 
 
 # ----------------------------
@@ -284,6 +342,52 @@ def run_plane_detector(
 
 
 # ----------------------------
+# Row construction
+# ----------------------------
+
+def base_row_from_job(job: ExperimentJob) -> dict[str, Any]:
+    """
+    Fields that identify the experiment configuration.
+
+    These fields are written for both successful and failed rows.
+    """
+    vx_gt, vy_gt = velocity_from_speed_direction(job.speed, job.direction_deg)
+
+    return {
+        "method": job.method,
+        "shape": job.shape,
+        "size": job.size,
+        "T": job.T,
+        "H": job.H,
+        "W": job.W,
+        "noise_std": job.noise_std,
+        "seed": job.seed,
+        "speed": job.speed,
+        "direction_deg": job.direction_deg,
+
+        "velocity_min": job.velocity_min,
+        "velocity_max": job.velocity_max,
+        "velocity_bins": job.velocity_bins,
+
+        "phase_hough_sigma": job.phase_hough_sigma,
+        "phase_peak_min_separation": job.phase_peak_min_separation,
+        "phase_min_frequency_radius": job.phase_min_frequency_radius,
+
+        "plane_sigma": job.plane_sigma,
+        "plane_alpha": job.plane_alpha,
+        "plane_dc_bins": job.plane_dc_bins,
+        "plane_keep_frac": job.plane_keep_frac,
+        "plane_min_detection_separation": job.plane_min_detection_separation,
+
+        "use_gpu": job.use_gpu,
+        "gpu_ids": ",".join(map(str, job.gpu_ids)),
+
+        "vx_gt": vx_gt,
+        "vy_gt": vy_gt,
+    }
+
+
+# ----------------------------
 # Single job
 # ----------------------------
 
@@ -343,74 +447,55 @@ def run_one_job(
 
         diag = score_diagnostics(out["score_map"])
 
-        return {
-            "status": "ok",
-            "error_message": "",
+        row = base_row_from_job(job)
+        row.update(
+            {
+                "status": "ok",
+                "error_message": "",
+                "traceback": "",
 
-            "method": job.method,
-            "shape": job.shape,
-            "size": job.size,
-            "T": job.T,
-            "H": job.H,
-            "W": job.W,
-            "noise_std": job.noise_std,
-            "seed": job.seed,
-            "speed": job.speed,
-            "direction_deg": job.direction_deg,
+                "vx_hat": vx_hat,
+                "vy_hat": vy_hat,
 
-            "vx_gt": vx_gt,
-            "vy_gt": vy_gt,
-            "vx_hat": vx_hat,
-            "vy_hat": vy_hat,
+                "endpoint_error": epe,
+                "speed_error": spd_err,
+                "angular_error_deg": ang_err,
+                "success_at_0.1": bool(epe <= 0.1),
+                "success_at_0.2": bool(epe <= 0.2),
+                "success_at_0.5": bool(epe <= 0.5),
 
-            "endpoint_error": epe,
-            "speed_error": spd_err,
-            "angular_error_deg": ang_err,
-            "success_at_0.1": bool(epe <= 0.1),
-            "success_at_0.2": bool(epe <= 0.2),
-            "success_at_0.5": bool(epe <= 0.5),
-
-            "runtime_sec": out["runtime_sec"],
-            **diag,
-        }
+                "runtime_sec": out["runtime_sec"],
+                **diag,
+            }
+        )
+        return row
 
     except Exception as e:
-        vx_gt, vy_gt = velocity_from_speed_direction(job.speed, job.direction_deg)
+        row = base_row_from_job(job)
+        row.update(
+            {
+                "status": "exception",
+                "error_message": str(e),
+                "traceback": traceback.format_exc(),
 
-        return {
-            "status": "exception",
-            "error_message": str(e),
-            "traceback": traceback.format_exc(),
+                "vx_hat": float("nan"),
+                "vy_hat": float("nan"),
 
-            "method": job.method,
-            "shape": job.shape,
-            "size": job.size,
-            "T": job.T,
-            "H": job.H,
-            "W": job.W,
-            "noise_std": job.noise_std,
-            "seed": job.seed,
-            "speed": job.speed,
-            "direction_deg": job.direction_deg,
+                "endpoint_error": float("nan"),
+                "speed_error": float("nan"),
+                "angular_error_deg": float("nan"),
+                "success_at_0.1": False,
+                "success_at_0.2": False,
+                "success_at_0.5": False,
 
-            "vx_gt": vx_gt,
-            "vy_gt": vy_gt,
-            "vx_hat": float("nan"),
-            "vy_hat": float("nan"),
-
-            "endpoint_error": float("nan"),
-            "speed_error": float("nan"),
-            "angular_error_deg": float("nan"),
-            "success_at_0.1": False,
-            "success_at_0.2": False,
-            "success_at_0.5": False,
-
-            "runtime_sec": float("nan"),
-            "top1_score": float("nan"),
-            "top2_score": float("nan"),
-            "peak_ratio": float("nan"),
-            "peak_margin": float("nan"),
-        }
+                "runtime_sec": float("nan"),
+                "top1_score": float("nan"),
+                "top2_score": float("nan"),
+                "peak_ratio": float("nan"),
+                "peak_margin": float("nan"),
+            }
+        )
+        return row
 
 
 # ----------------------------
@@ -518,6 +603,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunksize", type=int, default=1)
     parser.add_argument("--limit", type=int, default=None)
 
+    # Resume / overwrite
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from an existing CSV by counting completed rows and "
+            "skipping that many deterministic jobs."
+        ),
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Delete existing output CSV and metadata before running.",
+    )
+
     return parser.parse_args()
 
 
@@ -527,6 +627,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    if args.resume and args.overwrite:
+        raise ValueError("Use either --resume or --overwrite, not both.")
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -538,14 +641,55 @@ def main() -> None:
 
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.overwrite:
+        if out_path.exists():
+            print(f"[overwrite] Removing existing CSV: {out_path}")
+            out_path.unlink()
+
+        if metadata_path.exists():
+            print(f"[overwrite] Removing existing metadata: {metadata_path}")
+            metadata_path.unlink()
+
     jobs = build_jobs(args)
 
     if args.limit is not None:
         jobs = jobs[: args.limit]
 
-    print(f"Total jobs: {len(jobs)}")
+    resume_n = 0
+    existing_results: list[dict[str, Any]] = []
+
+    if args.resume:
+        resume_n = count_existing_rows(out_path)
+        existing_results = load_existing_results(out_path)
+
+        if resume_n > len(jobs):
+            print(
+                f"[resume] Existing CSV has {resume_n} rows, but current job list "
+                f"has only {len(jobs)} jobs."
+            )
+            print(
+                "[resume] This usually means you changed CLI arguments. "
+                "Refusing to continue because row-count resume would be unsafe."
+            )
+            raise ValueError("Existing CSV has more rows than current job list.")
+
+        print(f"[resume] Existing rows found: {resume_n}")
+        print(f"[resume] These rows will be kept.")
+    elif out_path.exists() and out_path.stat().st_size > 0:
+        print(f"[warning] Output CSV already exists: {out_path}")
+        print("[warning] Not using --resume and not using --overwrite.")
+        print("[warning] New rows will be appended to the existing CSV.")
+        print("[warning] Usually you want either --resume or --overwrite.")
+
+    jobs_to_run = jobs[resume_n:]
+
+    print(f"Total jobs in full grid: {len(jobs)}")
+    print(f"Jobs already completed: {resume_n}")
+    print(f"Jobs remaining: {len(jobs_to_run)}")
     print(f"Methods: {args.methods}")
+    print(f"Shapes: {args.shapes}")
     print(f"Output: {out_path}")
+    print(f"Metadata: {metadata_path}")
     print(f"Workers: {args.num_workers}")
     print(f"Use GPU: {args.use_gpu}")
     if args.use_gpu:
@@ -555,22 +699,28 @@ def main() -> None:
         json.dump(
             {
                 "args": vars(args),
-                "num_jobs": len(jobs),
+                "num_jobs_full_grid": len(jobs),
+                "num_jobs_completed_before_this_run": resume_n,
+                "num_jobs_remaining_at_start": len(jobs_to_run),
                 "jobs_example": asdict(jobs[0]) if len(jobs) > 0 else None,
             },
             f,
             indent=2,
         )
 
-    results: list[dict[str, Any]] = []
+    if len(jobs_to_run) == 0:
+        print("\nNothing to do. All jobs are already completed.")
+        return
 
-    # Write header progressively.
-    if out_path.exists():
-        out_path.unlink()
+    # Keep old results only for summary counts. We do not rewrite the old CSV.
+    results: list[dict[str, Any]] = list(existing_results)
 
     t_global = perf_counter()
 
-    packed_jobs = list(enumerate(jobs))
+    # Important:
+    # The worker_index passed here is local to this resumed run, not the original
+    # full-grid index. That is fine because it is only used to assign GPUs.
+    packed_jobs = list(enumerate(jobs_to_run))
 
     with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
         futures = [
@@ -583,17 +733,20 @@ def main() -> None:
             results.append(row)
 
             df_one = pd.DataFrame([row])
-            write_header = not out_path.exists()
+            write_header = not out_path.exists() or out_path.stat().st_size == 0
             df_one.to_csv(out_path, mode="a", header=write_header, index=False)
 
-            if i % 10 == 0 or i == len(jobs):
+            if i % 2 == 0 or i == len(jobs_to_run):
                 elapsed = perf_counter() - t_global
-                ok = sum(r["status"] == "ok" for r in results)
+                ok = sum(r.get("status") == "ok" for r in results)
                 fail = len(results) - ok
+
                 print(
-                    f"{i}/{len(jobs)} done | "
+                    f"{i}/{len(jobs_to_run)} newly done | "
+                    f"total_rows_now={len(results)} | "
                     f"ok={ok} fail={fail} | "
-                    f"elapsed={elapsed:.1f}s"
+                    f"elapsed={elapsed:.1f}s",
+                    flush=True,
                 )
 
     df = pd.DataFrame(results)
@@ -604,7 +757,7 @@ def main() -> None:
 
     if len(df) > 0:
         print("\nStatus counts:")
-        print(df["status"].value_counts())
+        print(df["status"].value_counts(dropna=False))
 
         if "endpoint_error" in df.columns:
             print("\nTop-level summary:")
