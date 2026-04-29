@@ -2,10 +2,10 @@
 #SBATCH --job-name=one_obj_resume
 #SBATCH --output=logs/one_obj_resume_%A_%a.out
 #SBATCH --error=logs/one_obj_resume_%A_%a.err
-#SBATCH --time=06:00:00
+#SBATCH --time=20:00:00
 #SBATCH --partition=gorman-gpu
-#SBATCH --array=0-2
-#SBATCH --cpus-per-task=12
+#SBATCH --array=0-1
+#SBATCH --cpus-per-task=19
 
 set -euo pipefail
 
@@ -19,8 +19,6 @@ if [ "$TASK_ID" -eq 0 ]; then
     SHAPE=gaussian
 elif [ "$TASK_ID" -eq 1 ]; then
     SHAPE=disk
-elif [ "$TASK_ID" -eq 2 ]; then
-    SHAPE=square
 else
     echo "Unknown task id: $TASK_ID"
     exit 1
